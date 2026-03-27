@@ -146,6 +146,10 @@ python poc.py import-spec spec.md             # seed assumptions as Knowledge Ga
 python poc.py import-spec spec.md \
   --artifact src/utils/parser.py             # bind gaps to a specific file
 python poc.py import-spec spec.md --dry-run  # preview without writing to the database
+
+# static analysis
+python poc.py verify src/utils/parser.py        # deterministic gap detection — zero API calls
+python poc.py verify src/utils/parser.py --strict  # flag all uncited structural units
 ```
 
 **4. Enable PR enforcement** (after the tool has already saved you real hours)
@@ -213,8 +217,10 @@ spec-writer eliminates ambiguity *before* the agent builds. proof-of-contributio
     → Spec + Plan + Tasks + Assumptions (with sources)
     → python poc.py import-spec spec.md --artifact src/utils/csv_exporter.py
     → Agent implements
+    → python poc.py verify src/utils/csv_exporter.py
+    → Deterministic: which structural units have no human source (zero API calls)
     → python poc.py trace src/utils/csv_exporter.py
-    → Shows: which assumptions shipped with no human source
+    → Shows: full attribution + all remaining gaps
     → python poc.py add src/utils/csv_exporter.py
     → Full chain: feature request → spec decision → human source → code
 ```
@@ -259,3 +265,39 @@ Works across Claude Code, Cursor, Gemini CLI, and any agent that supports the Ag
 Built by [Daniel Nwaneri](https://dev.to/dannwaneri).
 
 The core idea — that AI systems should point to human experts rather than replace them — is the 2026 version of a problem the open source community has always cared about: credit, attribution, and the humans behind the work.
+
+---
+
+## FAQ
+
+**Does this consume extra API tokens?**
+
+Almost none. The `import-spec`, `trace`, `report`, `add`, and `experts` commands are pure local operations — SQLite reads and writes, zero API calls, zero tokens.
+
+The only token cost is the Provenance Block itself. When the skill is active, Claude appends attribution metadata to generated output. A Provenance Block runs roughly 150-250 tokens. At current Sonnet pricing that's a fraction of a cent per generation — the same category of cost as asking Claude to add inline comments to code.
+
+The spec-writer call that feeds `import-spec` is a token cost you were already paying before proof-of-contribution existed. The `import-spec` command just parses that output locally. No new LLM calls introduced.
+
+**Does it work on Windows?**
+
+Yes. The CLI is pure Python with no platform-specific dependencies. One gotcha: if you create spec files using PowerShell's `echo`, they save as UTF-16. Create them with `python -c "open('spec.md', 'w', encoding='utf-8').write(...)"` or any text editor set to UTF-8 to avoid encoding errors.
+
+**Do I need to run `import-spec` before every build?**
+
+Only when you've used spec-writer first. If you're generating code without a spec, run `poc.py verify` directly — it detects gaps via static analysis without any AI involvement. `import-spec` makes gaps more precise by tying them to named spec assumptions. Without it, `verify` still surfaces all uncited structural units as a baseline.
+
+**What happens when I run `poc.py add` after seeding gaps?**
+
+When you record a human source with `poc.py add`, the tool fuzzy-matches your insight text against open gap claims. If the words overlap meaningfully, the gap auto-closes and `source_id` gets populated. Run `poc.py trace` after adding to confirm which gaps remain open.
+
+**Can I use this without Claude Code?**
+
+Yes. The skill file (`SKILL.md`) works with any agent that supports the Agent Skills standard — Cursor, Gemini CLI, and others. The CLI (`poc.py`) and `import-spec` command are standalone Python and work regardless of which agent generated the code.
+
+**Does `verify` work without spec-writer?**
+
+Yes. Without a seeded spec, `verify` parses the file's structure and surfaces all functions, branches, and return paths as uncited units. It's less precise than the spec-writer path — every structural unit shows as a gap rather than only the ones tied to assumptions — but it requires no prior setup and makes zero API calls. Run `import-spec` first for deterministic gaps tied to your spec assumptions. Run `verify` alone for a structural baseline on any file.
+
+**When should I turn on the GitHub Action?**
+
+After `poc.py trace` has already saved you real time — not before. The enforcement works because by then the team understands the value and fills in the provenance section willingly. Turning it on day one frames it as overhead. Turning it on after it's proven useful frames it as a standard.

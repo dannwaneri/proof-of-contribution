@@ -106,6 +106,18 @@ CREATE VIEW IF NOT EXISTS v_artifact_humans AS
   JOIN artifact_sources als ON als.artifact_id = ca.id
   JOIN human_sources hs     ON hs.id = als.source_id
   LEFT JOIN human_experts he ON he.id = hs.author_id;
+
+CREATE TABLE IF NOT EXISTS structural_units (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  artifact_id TEXT REFERENCES code_artifacts(id),
+  unit_type   TEXT NOT NULL,
+  unit_name   TEXT,
+  line_start  INTEGER,
+  line_end    INTEGER,
+  verified_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_su_artifact ON structural_units(artifact_id);
 """
 
 # ── config ────────────────────────────────────────────────────────────────────
@@ -229,7 +241,8 @@ jobs:
 # ── local CLI (poc.py) ────────────────────────────────────────────────────────
 # This is written to disk as poc.py in the project root.
 # Keep this in sync with the canonical poc.py in the repo.
-POC_CLI = r'''#!/usr/bin/env python3
+POC_CLI = r'''
+#!/usr/bin/env python3
 """
 poc.py — local Proof of Contribution CLI
 
@@ -241,21 +254,27 @@ Commands:
   python poc.py import-spec <spec-file>   Seed Knowledge Gaps from a spec-writer output
                 [--artifact <filepath>]   Bind gaps to a specific file (optional)
                 [--dry-run]               Preview without writing to the database
+  python poc.py verify <filepath>         Detect Knowledge Gaps via static analysis
+                [--strict]               Flag all uncited structural units as gaps
 
 Workflow with spec-writer:
   1. /spec-writer "export order history as CSV"   → generates spec with assumptions
   2. python poc.py import-spec spec.md \
        --artifact src/utils/csv_exporter.py       → seeds assumptions as Knowledge Gaps
   3. Agent implements the feature
-  4. python poc.py trace src/utils/csv_exporter.py → shows gaps with no human source
-  5. python poc.py add src/utils/csv_exporter.py   → resolve gaps by adding citations
+  4. python poc.py verify src/utils/csv_exporter.py → deterministic gap detection
+  5. python poc.py trace src/utils/csv_exporter.py  → full attribution + gaps
+  6. python poc.py add src/utils/csv_exporter.py    → resolve gaps by adding citations
 """
 
+import ast
 import re
 import sys
 import sqlite3
-from pathlib import Path
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 
 DB_PATH = Path(".poc/provenance.db")
 
@@ -325,11 +344,11 @@ def cmd_trace(filepath):
 
 def cmd_report():
     db = get_db()
-    total    = db.execute("SELECT COUNT(*) FROM code_artifacts").fetchone()[0]
-    with_prov= db.execute("SELECT COUNT(DISTINCT artifact_id) FROM artifact_sources").fetchone()[0]
-    gaps     = db.execute("SELECT COUNT(*) FROM knowledge_claims WHERE source_id IS NULL").fetchone()[0]
-    resolved = db.execute("SELECT COUNT(*) FROM knowledge_claims WHERE source_id IS NOT NULL").fetchone()[0]
-    experts  = db.execute("SELECT COUNT(*) FROM human_experts").fetchone()[0]
+    total     = db.execute("SELECT COUNT(*) FROM code_artifacts").fetchone()[0]
+    with_prov = db.execute("SELECT COUNT(DISTINCT artifact_id) FROM artifact_sources").fetchone()[0]
+    gaps      = db.execute("SELECT COUNT(*) FROM knowledge_claims WHERE source_id IS NULL").fetchone()[0]
+    resolved  = db.execute("SELECT COUNT(*) FROM knowledge_claims WHERE source_id IS NOT NULL").fetchone()[0]
+    experts   = db.execute("SELECT COUNT(*) FROM human_experts").fetchone()[0]
 
     print(f"\n{BOLD}Proof of Contribution Report{RESET}")
     print("─" * 40)
@@ -382,7 +401,7 @@ def cmd_add(filepath):
     print(f"\n{BOLD}Recording provenance for: {filepath}{RESET}")
     print("(Press Ctrl+C to cancel)\n")
 
-    artifact_id = filepath.replace("/", "_").replace(".", "_")
+    artifact_id = filepath.replace("/", "_").replace("\\", "_").replace(".", "_")
     db.execute("""
         INSERT OR IGNORE INTO code_artifacts (id, filepath, description)
         VALUES (?, ?, ?)
@@ -492,7 +511,12 @@ def cmd_import_spec(spec_file, artifact, dry_run):
         print(f"{RED}✘ File not found: {spec_path}{RESET}")
         sys.exit(1)
 
-    assumptions = parse_assumptions(spec_path.read_text(encoding="utf-8"))
+    try:
+        spec_text = spec_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        spec_text = spec_path.read_text(encoding="utf-16")
+
+    assumptions = parse_assumptions(spec_text)
     if not assumptions:
         print(f"{YELLOW}⚠ No '## Assumptions to review' section found in {spec_path}.{RESET}")
         print("  Make sure this is a spec-writer output file.")
@@ -544,12 +568,258 @@ def cmd_import_spec(spec_file, artifact, dry_run):
     if artifact_id:
         print(f"  {CYAN}→{RESET}  Bound to: {artifact_id}")
         print(f"  After the agent builds, run:")
-        print(f"  {CYAN}python poc.py trace {artifact_id}{RESET}")
-        print(f"  {CYAN}python poc.py add {artifact_id}{RESET}")
+        print(f"  {CYAN}python poc.py verify {artifact_id}{RESET}  — deterministic gap check")
+        print(f"  {CYAN}python poc.py trace {artifact_id}{RESET}   — full attribution view")
+        print(f"  {CYAN}python poc.py add {artifact_id}{RESET}     — cite sources, close gaps")
     else:
         print(f"  {CYAN}python poc.py report{RESET}  — see overall gap coverage")
     print(f"\n  {YELLOW}Any assumption that ships without a cited human source")
-    print(f"  will appear as a Knowledge Gap in `poc.py trace`.{RESET}\n")
+    print(f"  will appear as a Knowledge Gap in `poc.py verify` and `trace`.{RESET}\n")
+
+
+# ── verify ─────────────────────────────────────────────────────────────────────
+# Static analyser — detects Knowledge Gaps without AI self-reporting.
+# Uses Python's ast module to extract structural units, then cross-checks
+# against seeded knowledge_claims. Zero API calls. Exits 0 (clean) or 1 (gaps).
+
+class ParseError(Exception):
+    pass
+
+
+@dataclass
+class StructuralUnit:
+    name: str
+    unit_type: str      # 'function' | 'branch' | 'return_path'
+    line_start: int
+    line_end: int
+
+    def __post_init__(self):
+        valid = {"function", "branch", "return_path"}
+        if self.unit_type not in valid:
+            raise ValueError(f"unit_type must be one of {valid}, got '{self.unit_type}'")
+
+    def summary(self):
+        return f"{self.unit_type}: {self.name} (lines {self.line_start}–{self.line_end})"
+
+
+# Parser registry — maps extension to parser function
+PARSER_REGISTRY = {
+    ".py":  "_parse_python",
+    ".pyw": "_parse_python",
+}
+
+
+def _parse_python(filepath):
+    """Parse a Python file into StructuralUnits using ast."""
+    path = Path(filepath)
+    try:
+        source = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        source = path.read_text(encoding="latin-1")
+    except Exception as e:
+        raise ParseError(f"Cannot read {filepath}: {e}") from e
+
+    try:
+        tree = ast.parse(source, filename=filepath)
+    except SyntaxError as e:
+        raise ParseError(f"Syntax error in {filepath} at line {e.lineno}: {e.msg}") from e
+
+    units = []
+    branch_counter = [0]
+
+    class Visitor(ast.NodeVisitor):
+        def visit_FunctionDef(self, node):
+            end = getattr(node, "end_lineno", node.lineno)
+            units.append(StructuralUnit(node.name, "function", node.lineno, end))
+            self.generic_visit(node)
+
+        def visit_AsyncFunctionDef(self, node):
+            end = getattr(node, "end_lineno", node.lineno)
+            units.append(StructuralUnit(node.name, "function", node.lineno, end))
+            self.generic_visit(node)
+
+        def visit_If(self, node):
+            branch_counter[0] += 1
+            n = branch_counter[0]
+            try:
+                cond = ast.unparse(node.test)
+            except Exception:
+                cond = f"branch_{n}"
+            if len(cond) > 60:
+                cond = cond[:57] + "..."
+            end = getattr(node, "end_lineno", node.lineno)
+            units.append(StructuralUnit(f"if {cond}", "branch", node.lineno, end))
+            if node.orelse and not isinstance(node.orelse[0], ast.If):
+                s = node.orelse[0].lineno
+                e = getattr(node.orelse[-1], "end_lineno", node.orelse[-1].lineno)
+                units.append(StructuralUnit(f"else (branch_{n})", "branch", s, e))
+            self.generic_visit(node)
+
+        def visit_Return(self, node):
+            if node.value is not None:
+                try:
+                    val = ast.unparse(node.value)
+                except Exception:
+                    val = "value"
+                if len(val) > 50:
+                    val = val[:47] + "..."
+                units.append(StructuralUnit(f"return {val}", "return_path",
+                                            node.lineno, node.lineno))
+            self.generic_visit(node)
+
+    Visitor().visit(tree)
+    units.sort(key=lambda u: u.line_start)
+    return units
+
+
+def _fuzzy_match(unit_name, claim_text, threshold=2):
+    u = set(unit_name.lower().split())
+    c = set(claim_text.lower().split())
+    return len(u & c) >= threshold
+
+
+def _ensure_structural_units_table(db):
+    """Add structural_units table if missing (migration for existing databases)."""
+    tables = {r[0] for r in
+              db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    if "structural_units" not in tables:
+        db.executescript("""
+            CREATE TABLE IF NOT EXISTS structural_units (
+              id          INTEGER PRIMARY KEY AUTOINCREMENT,
+              artifact_id TEXT REFERENCES code_artifacts(id),
+              unit_type   TEXT NOT NULL,
+              unit_name   TEXT,
+              line_start  INTEGER,
+              line_end    INTEGER,
+              verified_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_su_artifact
+              ON structural_units(artifact_id);
+        """)
+        cols = {r[1] for r in
+                db.execute("PRAGMA table_info(knowledge_claims)").fetchall()}
+        if "structural_unit_id" not in cols:
+            db.execute(
+                "ALTER TABLE knowledge_claims "
+                "ADD COLUMN structural_unit_id INTEGER REFERENCES structural_units(id)"
+            )
+        db.commit()
+
+
+def cmd_verify(filepath, strict=False):
+    ext = Path(filepath).suffix.lower()
+    parser_name = PARSER_REGISTRY.get(ext)
+
+    if parser_name is None:
+        print(f"{YELLOW}⚠ No parser available for {ext} files.{RESET}")
+        print(f"  Supported: {', '.join(PARSER_REGISTRY.keys())}")
+        return 2
+
+    if not Path(filepath).exists():
+        print(f"{RED}✘ File not found: {filepath}{RESET}")
+        return 2
+
+    try:
+        parse_fn = globals()[parser_name]
+        units = parse_fn(filepath)
+    except ParseError as e:
+        print(f"{RED}✘ Parse error: {e}{RESET}")
+        return 2
+
+    if not units:
+        print(f"{YELLOW}⚠ No structural units found in {filepath}.{RESET}")
+        return 0
+
+    db = get_db()
+    _ensure_structural_units_table(db)
+
+    # Ensure artifact exists
+    artifact_id = filepath.replace("/", "_").replace("\\", "_").replace(".", "_")
+    db.execute("""
+        INSERT OR IGNORE INTO code_artifacts (id, filepath, description)
+        VALUES (?, ?, ?)
+    """, (artifact_id, filepath, filepath))
+
+    # Store units
+    now = datetime.now().isoformat()
+    for unit in units:
+        db.execute("""
+            INSERT INTO structural_units
+              (artifact_id, unit_type, unit_name, line_start, line_end, verified_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (artifact_id, unit.unit_type, unit.name,
+              unit.line_start, unit.line_end, now))
+    db.commit()
+
+    # Fetch seeded claims
+    claims = db.execute("""
+        SELECT kc.id, kc.claim_text, kc.confidence, kc.source_id
+        FROM knowledge_claims kc
+        JOIN ai_sessions s ON s.id = kc.session_id
+        JOIN code_artifacts a ON a.session_id = s.id
+        WHERE a.id = ?
+    """, (artifact_id,)).fetchall()
+    claims = [{"id": r[0], "text": r[1], "confidence": r[2],
+               "resolved": r[3] is not None} for r in claims]
+    has_seeded = len(claims) > 0
+
+    # Cross-check
+    gaps, covered = [], []
+    for unit in units:
+        matched = next(
+            (c for c in claims if c["resolved"] and _fuzzy_match(unit.name, c["text"])),
+            None
+        )
+        if matched:
+            covered.append((unit, matched))
+        else:
+            if strict:
+                gaps.append((unit, None))
+            else:
+                unresolved = next(
+                    (c for c in claims
+                     if not c["resolved"] and _fuzzy_match(unit.name, c["text"])),
+                    None
+                )
+                if unresolved or not has_seeded:
+                    gaps.append((unit, unresolved))
+
+    db.close()
+
+    # ── Output ─────────────────────────────────────────────────────────────────
+    print(f"\n{BOLD}Verify: {filepath}{RESET}")
+    print("─" * 60)
+    print(f"  Structural units detected : {len(units)}")
+    print(f"  Seeded claims             : {len(claims)}")
+    print(f"  Covered by cited source   : {len(covered)}")
+    print(f"  Deterministic gaps        : {len(gaps)}")
+    print()
+
+    if covered:
+        print(f"{GREEN}Covered units (human source cited):{RESET}")
+        for unit, claim in covered:
+            print(f"  {GREEN}✔{RESET} {unit.summary()}")
+            print(f"      ← {claim['text'][:70]}")
+        print()
+
+    if gaps:
+        if not has_seeded:
+            print(f"{YELLOW}⚠ No spec imported — showing all uncited structural units.{RESET}")
+            print(f"  Run: {CYAN}python poc.py import-spec spec.md --artifact {filepath}{RESET}")
+            print(f"  for deterministic gap detection.\n")
+
+        print(f"{YELLOW}Deterministic Knowledge Gaps (no human source):{RESET}")
+        for unit, claim in gaps:
+            colour = RED if (claim and claim["confidence"] == "LOW") else YELLOW
+            print(f"  {colour}•{RESET} {unit.summary()}")
+            if claim:
+                print(f"      Seeded assumption: {claim['text'][:70]}")
+        print()
+        print(f"  Resolve: {CYAN}python poc.py add {filepath}{RESET}")
+        return 1
+
+    print(f"{GREEN}✔ No Knowledge Gaps — all detected units have cited sources.{RESET}\n")
+    return 0
 
 
 # ── router ─────────────────────────────────────────────────────────────────────
@@ -593,6 +863,13 @@ if __name__ == "__main__":
             else:
                 i += 1
         cmd_import_spec(spec_file, artifact, dry_run)
+
+    elif cmd == "verify":
+        if len(sys.argv) < 3:
+            print("Usage: python poc.py verify <filepath> [--strict]"); sys.exit(1)
+        fp     = sys.argv[2]
+        strict = "--strict" in sys.argv[3:]
+        sys.exit(cmd_verify(fp, strict))
 
     else:
         print(f"Unknown command: {cmd}")
