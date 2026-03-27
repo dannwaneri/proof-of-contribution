@@ -47,32 +47,29 @@ The AI isn't grading its own exam. The spec is the answer key. Any assumption th
 Invoke the skill and Claude automatically appends a **Provenance Block** to every generated artifact:
 
 ```
-╔══════════════════════════════════════════════════════╗
-║  PROOF OF CONTRIBUTION                               ║
-╠══════════════════════════════════════════════════════╣
-║  Generated artifact: fetch_github_discussions()      ║
-║  Confidence: MEDIUM                                  ║
-╠══════════════════════════════════════════════════════╣
-║  HUMAN SOURCES THAT INSPIRED THIS                    ║
-║                                                      ║
-║  [1] GitHub GraphQL API Documentation Team           ║
-║      Source type: Official Docs                      ║
-║      URL: docs.github.com/en/graphql                 ║
-║      Contribution: cursor-based pagination pattern   ║
-║                                                      ║
-║  [2] GitHub Community (multiple contributors)        ║
-║      Source type: GitHub Discussions                 ║
-║      URL: github.com/community/community             ║
-║      Contribution: "ghost" fallback for deleted      ║
-║                    accounts — surfaced in bug reports║
-╠══════════════════════════════════════════════════════╣
-║  KNOWLEDGE GAPS (AI synthesized, no human cited)     ║
-║  - Error handling / retry logic                      ║
-║  - Rate limit strategy                               ║
-╠══════════════════════════════════════════════════════╣
-║  RECOMMENDED HUMAN EXPERTS TO CONSULT                ║
-║  - github.com/octokit community for pagination       ║
-╚══════════════════════════════════════════════════════╝
+## PROOF OF CONTRIBUTION
+Generated artifact: fetch_github_discussions()
+Confidence: MEDIUM
+
+## HUMAN SOURCES THAT INSPIRED THIS
+
+[1] GitHub GraphQL API Documentation Team
+    Source type: Official Docs
+    URL: docs.github.com/en/graphql
+    Contribution: cursor-based pagination pattern
+
+[2] GitHub Community (multiple contributors)
+    Source type: GitHub Discussions
+    URL: github.com/community/community
+    Contribution: "ghost" fallback for deleted accounts
+                  surfaced in bug reports
+
+## KNOWLEDGE GAPS (AI synthesized, no human cited)
+- Error handling / retry logic
+- Rate limit strategy
+
+## RECOMMENDED HUMAN EXPERTS TO CONSULT
+- github.com/octokit community for pagination
 ```
 
 ---
