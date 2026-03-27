@@ -1,0 +1,15 @@
+{
+  "version": "1.1.0",
+  "project": "proof-of-contribution",
+  "db": ".poc/provenance.db",
+  "enforce_on_commit": false,
+  "enforce_on_pr": true,
+  "confidence_threshold": "MEDIUM",
+  "platforms": [
+    "github",
+    "stackoverflow",
+    "discourse",
+    "docs"
+  ],
+  "created_at": "2026-03-27T10:55:02.794889"
+}
